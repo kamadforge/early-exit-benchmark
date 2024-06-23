@@ -5,7 +5,7 @@ import torch.nn
 from torch import nn, optim
 from torch.nn.init import calculate_gain
 
-from architectures.avit import AvitWrapper
+# from architectures.avit import AvitWrapper
 from architectures.custom import FCNet, DCNet
 from architectures.early_exits.gpf import GPF
 from architectures.early_exits.l2w import L2W
