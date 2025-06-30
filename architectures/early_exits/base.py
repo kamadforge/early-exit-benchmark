@@ -106,7 +106,7 @@ class EarlyExitingBase(nn.Module, ABC):
     def forward(self, x_input: torch.Tensor):
         assert self._mode in {'selected', 'threshold', 'all', 'patience'}
         enable_grad = True if self.training else False
-        with torch.set_grad_enabled(enable_grad):
+        with ((torch.set_grad_enabled(enable_grad))):
             fg, x, head_outputs = self.forward_generator(x_input), None, []
             if self._mode == 'threshold':
                 sample_exited_at = torch.zeros(x_input.size(0), dtype=torch.int) - 1
@@ -169,7 +169,8 @@ class EarlyExitingBase(nn.Module, ABC):
                     try:
                         x, head_output = fg.send(x)
                     except StopIteration:
-                        assert len(head_outputs) == self.number_of_heads
+                        assert len(head_outputs) == self.number_of_heads, \
+                            f'{len(head_outputs)=} {self.number_of_heads=}'
                         return head_outputs
                     head_outputs.append(head_output)
             else:

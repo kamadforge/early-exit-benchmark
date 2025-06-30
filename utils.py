@@ -2,7 +2,6 @@ import base64
 import hashlib
 import logging
 import numbers
-import os
 import warnings
 from collections import Counter, defaultdict
 from functools import reduce, partial
@@ -12,7 +11,6 @@ from typing import Union, Tuple, List, Dict, Set, FrozenSet, Callable, Iterator,
 
 import numpy as np
 import torch
-import wandb
 from accelerate import Accelerator
 from accelerate.state import AcceleratorState
 from accelerate.utils import patch_environment, PrepareForLaunch
@@ -21,7 +19,7 @@ from fvcore.nn.jit_handles import elementwise_flop_counter, get_shape
 from omegaconf import OmegaConf
 from torch import nn, Tensor, inf
 
-from datasets import DATASETS_NAME_MAP
+from datasets_config import DATASETS_NAME_MAP
 
 
 def clip_by_norm_(tensors, max_norm: float, norm_type: float = 2.0):
@@ -485,7 +483,7 @@ def flop_count(model: torch.nn.Module, input) -> FlopCountAnalysis:
 
 
 def get_loader(data: torch.utils.data.Dataset, batch_size: int, accelerator: Accelerator,
-               shuffle: bool = True, num_workers: int = 8, pin: bool = True):
+               shuffle: bool = True, num_workers: int = 16, pin: bool = True):
     loader = torch.utils.data.DataLoader(dataset=data,
                                          batch_size=batch_size,
                                          shuffle=shuffle,
@@ -512,7 +510,8 @@ def make_hash_sha256(o: Union[Tuple, List, Dict, Set, FrozenSet]) -> str:
 
 def generate_run_name(args) -> Tuple[str, str]:
     # Properties from the config that are NOT to be included into hashing.
-    omitted_keys = ['exp_id', 'runs_dir', 'eval_points', 'eval_batches', 'save_every', 'use_wandb', 'eval_thresholds',]
+    omitted_keys = ['exp_id', 'runs_dir', 'eval_points', 'eval_batches', 'save_every', 'use_wandb', 'eval_thresholds',
+                    'k_to_eval']
     args_dict = OmegaConf.to_container(args, resolve=True)
     hashed_flags = {k: v for k, v in args_dict.items() if k not in omitted_keys and v is not None}
     short_hash = make_hash_sha256(hashed_flags)[:8]
@@ -571,9 +570,9 @@ def retrieve_final(args, run_name: str, device: Union[torch.device, str] = 'cpu'
 def save_final(args, final_path, final_results):
     torch.save(final_results, final_path)
     logging.info(f'Saved final results to {str(final_path)}')
-    if args.use_wandb:
-        wandb.save(str(final_path))
-        logging.info(f'Saved final results to W&B')
+    # if args.use_wandb:
+    #     wandb.save(str(final_path))
+    #     logging.info(f'Saved final results to W&B')
 
 
 def create_model(model_class, model_args):
@@ -640,7 +639,8 @@ def accelerate_launcher(function, num_processes=None, mixed_precision="no", use_
             print(f"ProcessRaisedException: {e}")
 
 
-def submit_job(executor, job_func, *job_args, num_gpus=1):
+def submit_job(executor, job_func, *job_args, num_gpus=1, gpu_type=''):
+    executor.update_parameters(slurm_gpus_per_task=f'{gpu_type}{num_gpus}')
     if 0 <= num_gpus <= 1:
         return executor.submit(job_func, *job_args)
     elif num_gpus > 1:
@@ -651,18 +651,18 @@ def submit_job(executor, job_func, *job_args, num_gpus=1):
         return executor.submit(accelerate_launcher, job_partial, num_processes=num_gpus, use_port=distributed_port)
 
 
-
-def train_val_split(dataset, test_size=0.1, seed=42):
+def train_val_split(dataset, test_size=0.1, seed=42, stratify_by_labels=True):
     from sklearn.model_selection import train_test_split
     indices = np.arange(len(dataset))
-    
+
     labels = dataset.targets
-    train_indices, val_indices = train_test_split(indices, test_size=test_size, stratify=labels, random_state=seed)
-    
+    train_indices, val_indices = train_test_split(indices, test_size=test_size, stratify=labels if stratify_by_labels else None, random_state=seed)
+
     train_subset = torch.utils.data.Subset(dataset, train_indices)
     val_subset = torch.utils.data.Subset(dataset, val_indices)
-    
+
     return train_subset, val_subset
+
 
 def get_every_but_forbidden_parameter_names(model, forbidden_layer_types):
     """
@@ -679,21 +679,376 @@ def get_every_but_forbidden_parameter_names(model, forbidden_layer_types):
     result += list(model._parameters.keys())
     return result
 
+
 FORBIDDEN_LAYER_TYPES = [torch.nn.Embedding, torch.nn.LayerNorm, torch.nn.BatchNorm1d, torch.nn.BatchNorm2d]
 
-def gradients_norm(logger, module, step, is_ee=False, norm_type=2.0):
+
+def gradients_norm(tb_logger, module, step, is_ee=False, norm_type=2.0):
     prefix = 'ic_' if is_ee else ''
     allowed_parameter_names = get_every_but_forbidden_parameter_names(module, FORBIDDEN_LAYER_TYPES)
     evaluators = defaultdict(float)
     named_parameters = [(n, p) for n, p in module.named_parameters() if p.requires_grad]
     grad_norm_layers = []
     for n, p in named_parameters:
-        grad_norm_per_layer = torch.norm(p.grad, norm_type) if p.grad is not None else torch.tensor(0.0)
-        evaluators[f'gradient_norm_squared/{prefix}{n}'] = grad_norm_per_layer.item() ** 2
-        if n in allowed_parameter_names:
-            grad_norm_layers.append(grad_norm_per_layer)
-    grad_norm = torch.norm(torch.stack(grad_norm_layers), norm_type)
-    evaluators[f'gradient_norm_squared/{prefix}overall'] = grad_norm.item() ** 2
-    for name, value in evaluators.items():
-        logger.add_scalar(name, value, global_step=step)
+        if p.grad is not None:
+            grad_norm_per_layer = torch.norm(p.grad, norm_type)
+            evaluators[f'gradient_norm/{prefix}{n}'] = grad_norm_per_layer.item()
+            # evaluators[f'gradient_norm/{prefix}{n}'] = grad_norm_per_layer.item()
+            if n in allowed_parameter_names:
+                grad_norm_layers.append(grad_norm_per_layer)
+    grad_norm = torch.norm(torch.stack(grad_norm_layers), norm_type) if len(grad_norm_layers) != 0 else torch.tensor(
+        0.0)
+    evaluators[f'gradient_norm/{prefix}overall'] = grad_norm.item()
+    # evaluators[f'gradient_norm/{prefix}overall'] = grad_norm.item()
+    # dopisz zbieranie zakumulowanego gradientu dla każdego z bloków
+    tb_logger.log_scalars(evaluators)
+
+
+def count_monotonical_intervals(numbers):
+    """
+    Zlicza zmiany monotoniczności w ciągu liczb.
+
+    :param numbers: Lista liczb.
+    :return: Liczba zmian monotoniczności.
+    """
+    if len(numbers) < 2:
+        return 0
+
+    # Inicjalizacja zmiennych
+    changes = 0
+    direction = 0  # 0: nieokreślona, 1: rosnąca, -1: malejąca
+
+    for i in range(1, len(numbers)):
+        if numbers[i] > numbers[i - 1] and direction != 1:
+            changes += 1
+            direction = 1
+        elif numbers[i] < numbers[i - 1] and direction != -1:
+            changes += 1
+            direction = -1
+
+    return changes
+
+
+from copy import deepcopy
+from scipy.spatial.distance import cosine
+
+
+class GradientStatisticianEE:
+    # NARAZIE BEZ BIASÓW
+    # WYSZUKUJE ICS POPRZEZ ZAŁOŻENIE ŻE NAZYWAJĄ SIĘ _fc
+    def __init__(self, held_out, norm_type=2.0):
+        self.held_out = held_out
+        self.norm_type = norm_type
+        self.model_zero = None
+        self.model_last_checkpoint = None
+        self.logger = None
+        self.batch_size_gsee = 500
+
+    def gather_pred(self, model, phase, device):
+        held_out_x = self.held_out[f'x_{phase}'].to(device)
+        y_preds = [torch.tensor([], device=device) for _ in range(model.number_of_attached_heads + 1)]
+        for i in range(held_out_x.shape[0] // self.batch_size_gsee):
+            x_data = held_out_x[i * self.batch_size_gsee: (i + 1) * self.batch_size_gsee]
+            preds = model(x_data)
+            for i in range(len(preds)):
+                y_preds[i] = torch.cat([y_preds[i], preds[i]], axis=0)
+        return y_preds
+
+    def gather_gradients(self, model, criterion, phase):
+        device = next(model.parameters()).device
+        y_true = self.held_out[f'y_{phase}'].to(device)
+        # for param in model.parameters():
+        #     print('1', param.grad)
+        y_preds = self.gather_pred(model, phase, device)  # number_of_heads x batch_size x classes_num
+        # for param in model.parameters():
+        #     print('2', param.grad)
+        losses = [criterion(y_pred, y_true) for y_pred in y_preds]  # loss for each head
+
+        named_params = self.get_refined_params(model)  # only trainable weights
+
+        gradients_per_param_name = defaultdict(list)
+        gradients_per_ic = defaultdict(list)
+        # for param in model.parameters():
+        #     print('3', param.grad)
+
+        for i, loss in enumerate(losses):
+            # print('loss.requires_grad', loss.requires_grad)
+            grads = torch.autograd.grad(loss, list(named_params.values()), retain_graph=True, allow_unused=True)
+            # grads = torch.autograd.grad(loss, model.parameters(), retain_graph=True, allow_unused=True)
+            for (param_name, _), grad in zip(named_params.items(), grads):
+                if grad is not None and 'weight' in param_name:
+                    grad = grad.flatten()
+                    gradients_per_param_name[param_name].append(grad)
+                    gradients_per_ic[i].append((param_name, grad))
+
+        # gradients_per_param_name['ics'] = [v[0] for k,v in gradients_per_param_name.items() if '_fc' in k]  # różne ics mogą mieć różne wymiary
+        gradients_per_param_name = {k: v for k, v in gradients_per_param_name.items() if
+                                    len(v) > 1}  # I accept only non singular lists (all but gradients after the last attached IC)
+        return gradients_per_param_name, gradients_per_ic
+
+    def compute_gradient_stats(self, tc, phase, scope, step):
+        unwrapped_model = tc.accelerator.unwrap_model(tc.model)
+        unwrapped_model._base_model.eval()
+        print(next(unwrapped_model.parameters()).grad)
+        # unwrapped_model.zero_grad()  # resetujemy gradienty
+        postfix = f'____{scope}____{phase}'
+
+        evaluators = defaultdict(float)
+        self.allowed_parameter_names = get_every_but_forbidden_parameter_names(unwrapped_model, FORBIDDEN_LAYER_TYPES)
+        gradients_per_param_name, gradients_per_ic = self.gather_gradients(unwrapped_model, tc.criterion, phase)
+
+        self.gradient_norm(gradients_per_ic, gradients_per_param_name, evaluators, postfix)
+        self.gradient_direction_variance(gradients_per_param_name, evaluators, postfix)
+        self.gradient_direction_error(gradients_per_param_name, evaluators, postfix)
+        self.gradient_domination(gradients_per_param_name, evaluators, postfix)
+
+        if phase == 'train':  # między fazami zmieniają się jedynie gradienty
+            self.distance_between_ics(unwrapped_model, evaluators, postfix)
+            self.distance_between_models(unwrapped_model, self.model_zero, evaluators, postfix,
+                                         prefix='distance_from_initialization')  # przekaż model zero przed treningiem
+            self.distance_between_models(unwrapped_model, self.model_last_checkpoint, evaluators, postfix,
+                                         prefix='distance_from_last_checkpoint')  # zrób ifa jeżeli pierwszy raz to nie
+            self.weight_norms(unwrapped_model, evaluators, postfix)
+
+        unwrapped_model._base_model.train()
+        # unwrapped_model.zero_grad()  # resetujemy gradienty
+        self.model_last_checkpoint = deepcopy(unwrapped_model)
+        evaluators[f'steps/grads_stats_ee_{phase}'] = step
+        tc.writer.log_scalars(evaluators)
+        # for name, value in evaluators.items():
+        #     self.logger.add_scalar(name, value, global_step=step)
+        # self.logger.log_scalars(evaluators, step)
+
+    def gradient_norm(self, gradients, gradients2, evaluators, postfix):
+        grad_norm_layers = defaultdict(list)
+        for ic_i, gradient_list in gradients.items():  # po ics   # osobno każdy gradient
+            for param_name, grad in gradient_list:  # po parametrach
+                grad_norm_per_layer = torch.norm(grad, self.norm_type)
+                evaluators[f'gradient_norm_ic_{ic_i}/{param_name}_{postfix}'] = grad_norm_per_layer.item()
+                if param_name in self.allowed_parameter_names:
+                    grad_norm_layers[ic_i].append(grad_norm_per_layer)
+
+        for ic_i in grad_norm_layers:  # konkatenując wszystkie dla tego samego ic
+            grad_norm = torch.norm(torch.stack(grad_norm_layers[ic_i]), self.norm_type)
+            evaluators[f'run_stats/gradient_norm_ic_{ic_i}_overall_{postfix}'] = grad_norm.item()
+
+        grad_norm_layers = []
+        for param_name, gradient_list in gradients2.items():  # klasycznie
+            grad = torch.stack(gradient_list).sum(axis=0)
+            grad_norm_per_layer = torch.norm(grad, self.norm_type)
+            evaluators[f'gradient_norm_classic/{param_name}_{postfix}'] = grad_norm_per_layer.item()
+            if param_name in self.allowed_parameter_names and 'ics' not in param_name:
+                grad_norm_layers.append(grad_norm_per_layer)
+
+        grad_norm = torch.norm(torch.stack(grad_norm_layers), self.norm_type)  # całosciowo
+        evaluators[f'run_stats/gradient_norm_classic_overall_{postfix}'] = grad_norm.item()
+
+    def gradient_direction_variance(self, gradients, evaluators,
+                                    postfix):  # zamiast cos do średniej, rozważ między wszystkimi możliwymi wektorami
+        # taken from https://arxiv.org/abs/2303.01500 (GDV, page 4)
+        eps = torch.finfo(torch.float32).eps
+        for param_name, gradient_list in gradients.items():
+            gradient_list = torch.stack(gradient_list)
+            gradient_list /= (torch.norm(gradient_list, dim=1, keepdim=True) + eps)
+            nb_gradients = gradient_list.shape[0]
+
+            cos = gradient_list @ gradient_list.T  # cosine similarity matrix, number_of_heads x number_of_heads
+
+            coses = torch.triu(cos, diagonal=1)  # wybieram tak by kąty się nie powtarzały
+            coses = coses[coses.nonzero(as_tuple=True)].flatten()
+            gdv = (1 - coses.mean().item()) / 2
+
+            evaluators[f'gradient_direction_variance/{param_name}_{nb_gradients=}{postfix}'] = gdv
+
+    def gradient_direction_error(self, gradients, evaluators, postfix):
+        # taken from https://arxiv.org/abs/2303.01500 (GDE, page 4)
+        eps = torch.finfo(torch.float32).eps
+        for param_name, gradient_list in gradients.items():
+            gradient_list = torch.stack(gradient_list)
+            step_gradient = gradient_list.sum(axis=0, keepdim=True)
+            step_gradient /= (torch.norm(step_gradient, dim=1, keepdim=True) + eps)
+            gradient_list /= (torch.norm(gradient_list, dim=1, keepdim=True) + eps)
+            nb_gradients = gradient_list.shape[0]
+
+            cos = gradient_list @ step_gradient.T
+            gde = (1 - cos.mean().item()) / 2
+            evaluators[f'gradient_direction_error/{param_name}_{nb_gradients=}{postfix}'] = gde
+
+    def gradient_domination(self, gradients, evaluators, postfix):
+        # taken from https://arxiv.org/abs/2303.01500 (GDE, page 4)
+        eps = torch.finfo(torch.float32).eps
+        for param_name, gradient_list in gradients.items():
+            gradient_list = torch.stack(gradient_list)
+            step_gradient = gradient_list.sum(axis=0, keepdim=True)
+
+            l2_norm = torch.norm(gradient_list - step_gradient, dim=1)
+            for ic, l2 in enumerate(l2_norm):
+                evaluators[f'gradient_domination_l2_{ic=}/{param_name}{postfix}'] = l2.item()
+
+            step_gradient /= (torch.norm(step_gradient, dim=1, keepdim=True) + eps)
+            gradient_list /= (torch.norm(gradient_list, dim=1, keepdim=True) + eps)
+
+            coses = gradient_list @ step_gradient.T
+            for ic, cos in enumerate(coses):
+                evaluators[f'gradient_domination_cosine_{ic=}/{param_name}{postfix}'] = cos.item()
+
+    def distance_between_ics(self, model, evaluators, postfix):
+        named_params = self.get_refined_params(model._heads)
+        ics_params = [param.flatten().tolist() for param_name, param in named_params.items() if
+                      '_fc' in param_name and 'weight' in param_name]
+        # distances = pdist(ics_params, 'euclidean')
+        # idx = 0
+        for i in range(0, len(ics_params) - 1):
+            for j in range(i + 1, len(ics_params)):
+                if len(ics_params[i]) == len(ics_params[j]):
+                    ic_i_params = np.array(ics_params[i])
+                    ic_j_params = np.array(ics_params[j])
+                    evaluators[f'distance_between_ics_l2/{i}_and_{j}_{postfix}'] = np.linalg.norm(
+                        ic_i_params - ic_j_params, ord=2)
+                    evaluators[f'distance_between_ics_cosine/{i}_and_{j}_{postfix}'] = cosine(ic_i_params,
+                                                                                              ic_j_params) / 2
+
+    def distance_between_models(self, model1, model2, evaluators, postfix, prefix):
+        if model2 is None: return
+        overall_distance = 0.0
+        named_params1 = self.get_refined_params(model2)
+        named_params2 = self.get_refined_params(model1)
+
+        for (name1, param1), (_, param2) in zip(named_params1.items(), named_params2.items()):
+            dist = torch.norm(param1 - param2, self.norm_type).item()
+            if name1 in self.allowed_parameter_names:
+                overall_distance += dist
+            evaluators[f'{prefix}/{name1}{postfix}'] = dist
+        evaluators[f'run_stats/{prefix}_overall_{postfix}'] = np.sqrt(overall_distance)
+
+    def weight_norms(self, model, evaluators, postfix):
+        total_weights_norm = 0.0
+        total_biases_norm = 0.0
+        for param_name, param in self.get_refined_params(model).items():
+            norm = torch.norm(param.data, self.norm_type).item()
+            evaluators[f'model_weight_norm/{param_name}{postfix}'] = norm
+
+            if param_name in self.allowed_parameter_names:
+                if 'weight' in param_name:
+                    total_weights_norm += norm ** 2
+                elif 'bias' in param_name:
+                    total_biases_norm += norm ** 2
+
+        evaluators['total_weights_norm'] = np.sqrt(total_weights_norm)
+        # evaluators['total_biases_norm'] = np.sqrt(total_biases_norm)
+
+    def get_refined_params(self, model, only_params=False):
+        named_params = {name: param for name, param in model.named_parameters() if
+                        'weight' in name and param.requires_grad}
+        if only_params:
+            return list(named_params.values())
+        else:
+            return named_params
+
+
+import torch
+from scipy.stats import zscore
+from sklearn.cross_decomposition import CCA
+
+
+def compute_CKA(classifier_head1, classifier_head2, input_data):
+    # Przekształć dane wejściowe do reprezentacji dla każdej głowicy
+    representation_head1 = classifier_head1(input_data).detach().numpy()
+    representation_head2 = classifier_head2(input_data).detach().numpy()
+
+    # Normalizuj reprezentacje
+    representation_head1 = zscore(representation_head1, axis=0)
+    representation_head2 = zscore(representation_head2, axis=0)
+
+    # Oblicz CKA
+    cca = CCA(n_components=1)
+    cca.fit(representation_head1, representation_head2)
+    cca_score = cca.score(representation_head1, representation_head2)
+
+    return cca_score
+
+
+class GradientRescaleFunction(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, input, weight):
+        ctx.save_for_backward(input)
+        # logging.info(f'Setting rescale weight to: {weight}')
+        ctx.gd_scale_weight = weight
+        output = input
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        input = ctx.saved_tensors
+        grad_input = grad_weight = None
+        if ctx.needs_input_grad[0]:
+            # logging.info(f'Rescaling by: {ctx.gd_scale_weight}')
+            grad_input = ctx.gd_scale_weight * grad_output
+        return grad_input, grad_weight
+
+
+from torch.utils.data import Subset, DataLoader
+
+
+def create_dataloader(dataset, indices, loader_params):
+    subset = Subset(dataset, indices)
+    return DataLoader(subset, shuffle=False, **loader_params)
+
+
+import os
+
+import wandb
+
+
+class WandbLogger:
+    def __init__(self, entity, project, run_id, run_name, run_dir, args):
+        self.writer = wandb
+        if run_id is not None:
+            self.writer.init(
+                entity=entity,
+                project=project,
+                id=run_id,
+                resume='must',
+                dir=str(run_dir.resolve())
+            )
+        else:
+            self.writer.init(
+                entity=entity,
+                project=project,
+                config=dict(args),
+                name=run_name,
+                dir=str(run_dir.resolve())
+            )
+        self.writer.run.log_code('.', include_fn=lambda path: path.endswith('.py'))
+
+    def close(self):
+        self.writer.finish()
+
+    def log_model(self, model, criterion, log, log_freq: int = 1000, log_graph: bool = True):
+        self.writer.watch(model, criterion, log=log, log_freq=log_freq, log_graph=log_graph)
+
+    def log_histograms(self, hists):
+        self.writer.log(hists)
+
+    def log_scalars(self, evaluators, step=''):
+        self.writer.log(evaluators)
+
+    def log_plots(self, plot_images):
+        self.writer.log(plot_images)
+
+class StubLogger:
+    def close(self):
+        pass
+
+    def log_model(self, model, criterion, log, log_freq: int=1000, log_graph: bool=True):
+        pass
     
+    def log_histograms(self, hists):
+        pass
+
+    def log_scalars(self, evaluators, step=''):
+        pass
+        
+    def log_plots(self, plot_images):
+        pass

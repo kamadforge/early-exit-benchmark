@@ -4,7 +4,8 @@ import torch
 from torch import nn
 
 from architectures.early_exits.base import EarlyExitingBase
-from architectures.early_exits.heads import HEAD_TYPES, ViTHead, CNNHead, SwinHead
+from architectures.early_exits.heads import (HEAD_TYPES, CNNHead, SwinHead,
+                                             ViTHead)
 
 
 class SDN(EarlyExitingBase):
@@ -14,10 +15,16 @@ class SDN(EarlyExitingBase):
         self._place_at = place_at
         head_class = HEAD_TYPES[head_type]
         self._heads = nn.ModuleList()
-        input_size = self._base_model.input_size if hasattr(self._base_model, 'input_size') else 32
-        channels = self._base_model.input_channels if hasattr(self._base_model, 'input_channels') else 3
         base_model_device = next(base_model.parameters()).device
-        x_input = torch.randn(1, channels, input_size, input_size, device=base_model_device)
+        if hasattr(self._base_model, "input_sequences"):
+            x_input = {
+                k: torch.ones((1, v), device=base_model_device, dtype=torch.int) for k, v in
+                self._base_model.input_sequences.items()
+            }
+        else:
+            input_size = self._base_model.input_size if hasattr(self._base_model, 'input_size') else 32
+            channels = self._base_model.input_channels if hasattr(self._base_model, 'input_channels') else 3
+            x_input = torch.randn(1, channels, input_size, input_size, device=base_model_device)
         self._base_model.eval()
         # without the above eval() method call batch normalization statistics are updated in the forward below
         fg = self._base_model.forward_generator(x_input)
@@ -70,3 +77,16 @@ class SDN(EarlyExitingBase):
                 x = yield x, head_output
                 head_idx += 1
             i += 1
+
+    def freeze_branch(self, block_idx: int, freeze: bool = True):
+        def freeze_module(module: nn.Module):
+            module.requires_grad_(not freeze)
+            module.train(not freeze)
+
+        placements = sorted(self._place_at)
+        upper_bound_exclusive = placements[block_idx] + 1
+        lower_bound_inclusive = 0 if block_idx == 0 else placements[block_idx - 1] + 1
+        base_blocks = self._base_model.per_head_block_modules()
+        for idx in range(lower_bound_inclusive, upper_bound_exclusive):
+            freeze_module(base_blocks[idx])
+        freeze_module(self._heads[block_idx])

@@ -72,8 +72,12 @@ class ResNet(nn.Module):
         num_channels = 64 * extension
         if standard_first_conv is True:
             self.conv1 = nn.Conv2d(3, num_channels, kernel_size=7, stride=2, padding=3, bias=False)
-        else:
+        elif standard_first_conv is False:
             self.conv1 = nn.Conv2d(3, num_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        elif standard_first_conv == 'tinyimagenet':
+            # as in:
+            # https://github.com/yigitcankaya/Shallow-Deep-Networks/blob/a55644624c9dc064d1372f6a486055edd94c9def/architectures/CNNs/ResNet.py#L66-L67
+            self.conv1 = nn.Conv2d(3, num_channels, kernel_size=3, stride=2, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(num_channels)
         self.layer1 = self._make_layer(block, num_channels, num_blocks[0], stride=1)
         self.layer2 = self._make_layer(block, 2 * num_channels, num_blocks[1], stride=2)
@@ -114,6 +118,11 @@ class ResNet(nn.Module):
         x = self.linear(x)
         return x
 
+    def per_head_block_modules(self):
+        blocks = list(chain(self.layer1, self.layer2, self.layer3, self.layer4)) + [self.linear]
+        blocks[0] = nn.ModuleList([self.conv1, self.bn1, blocks[0]])
+        return blocks
+    
 
 def ResNet18(num_classes: int = 1000, standard_first_conv=True):
     return ResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, standard_first_conv=standard_first_conv)

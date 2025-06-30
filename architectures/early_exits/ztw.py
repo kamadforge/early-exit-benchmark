@@ -1,10 +1,11 @@
-from typing import Type, Set
+from typing import Set, Type
 
 import torch
 from torch import nn
 
 from architectures.early_exits.base import EarlyExitingBase
-from architectures.early_exits.heads import HEAD_TYPES, ViTHead, CNNHead, SwinHead
+from architectures.early_exits.heads import (HEAD_TYPES, CNNHead, SwinHead,
+                                             ViTHead)
 
 
 class ZTWCascading(EarlyExitingBase):
@@ -15,10 +16,15 @@ class ZTWCascading(EarlyExitingBase):
         self._place_at = place_at
         head_class = HEAD_TYPES[head_type]
         self._heads = nn.ModuleList()
-        input_size = self._base_model.input_size if hasattr(self._base_model, 'input_size') else 32
-        channels = self._base_model.input_channels if hasattr(self._base_model, 'input_channels') else 3
         base_model_device = next(base_model.parameters()).device
-        x_input = torch.randn(1, channels, input_size, input_size, device=base_model_device)
+        if hasattr(self._base_model, "input_sequences"):
+            x_input = {
+                k: torch.ones((1, v), device=base_model_device, dtype=torch.int) for k, v in self._base_model.input_sequences.items()
+            }
+        else:
+            input_size = self._base_model.input_size if hasattr(self._base_model, 'input_size') else 32
+            channels = self._base_model.input_channels if hasattr(self._base_model, 'input_channels') else 3
+            x_input = torch.randn(1, channels, input_size, input_size, device=base_model_device)
         self._base_model.eval()
         # without the above eval() method call batch normalization statistics are updated in the forward below
         fg = self._base_model.forward_generator(x_input)

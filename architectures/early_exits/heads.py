@@ -1,4 +1,4 @@
-from typing import Union, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -99,6 +99,43 @@ def conv_cascading_head_class(channel_divisors=(2,), strides=(2,), kernel_sizes=
     return ConvCascadingHead
 
 
+class ConvBasic(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel=3, stride=1, padding=1):
+        super(ConvBasic, self).__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=kernel, stride=stride,
+                      padding=padding, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(True)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def ranet_head_class(inter_1_size: Optional[int], inter_2_size: Optional[int], pool_size: int):
+    class RANetHead(CNNHead):
+        def __init__(self, in_size: int, out_size: int):
+            super().__init__()
+            nonlocal inter_1_size, inter_2_size
+            inter_1_size = in_size if inter_1_size is None else inter_1_size
+            inter_2_size = in_size if inter_2_size is None else inter_2_size
+            self.conv = nn.Sequential(
+                ConvBasic(in_size, inter_1_size, kernel=3, stride=2, padding=1),
+                ConvBasic(inter_1_size, inter_2_size, kernel=3, stride=2, padding=1),
+                nn.AdaptiveAvgPool2d(pool_size)
+            )
+            self.classifier = nn.Linear(inter_2_size * pool_size ** 2, out_size)
+
+        def forward(self, x):
+            x = self.conv(x)
+            x = x.flatten(1)
+            x = self.classifier(x)
+            return x
+
+    return RANetHead
+
+
 class ViTHead(nn.Module):
 
     def __init__(self):
@@ -108,7 +145,7 @@ class ViTHead(nn.Module):
 def vit_standard_head_class(num_layers, hidden_dim=None):
     assert num_layers > 0
 
-    class ViTStandardHead(ViTHead):
+    class TransformerStandardHead(ViTHead):
         def __init__(self, in_size: int, out_size: int):
             super().__init__()
             nonlocal hidden_dim
@@ -118,6 +155,7 @@ def vit_standard_head_class(num_layers, hidden_dim=None):
                 self._fcs.append(torch.nn.Linear(in_size, self._hidden_dim))
                 in_size = self._hidden_dim
             self._fcs.append(torch.nn.Linear(in_size, out_size))
+            self.squeeze = out_size == 1
 
         def forward(self, x: torch.Tensor):
             # take the hidden state corresponding to the first (class) token
@@ -125,15 +163,17 @@ def vit_standard_head_class(num_layers, hidden_dim=None):
             for i in range(num_layers - 1):
                 x = F.gelu(self._fcs[i](x))
             x = self._fcs[-1](x)
+            if self.squeeze:
+                x = x.squeeze()
             return x
 
-    return ViTStandardHead
+    return TransformerStandardHead
 
 
 def vit_cascading_head_class(num_layers, hidden_dim=None):
     assert num_layers > 0
 
-    class ViTCascadingHead(ViTHead):
+    class TransformerCascadingHead(ViTHead):
         def __init__(self, in_size: int, out_size: int, cascading: bool = True, layer_norm: bool = True,
                      detach: bool = True):
             super().__init__()
@@ -167,7 +207,7 @@ def vit_cascading_head_class(num_layers, hidden_dim=None):
             x = self._fcs[-1](x)
             return x
 
-    return ViTCascadingHead
+    return TransformerCascadingHead
 
 
 class SwinHead(nn.Module):
@@ -258,6 +298,8 @@ HEAD_TYPES = {
     'conv_cascading_4l': conv_cascading_head_class((2, 1, 1, 2), (1, 1, 2, 1), (3, 3, 3, 3)),
     'conv_5l': conv_head_class((2, 1, 1, 1, 1), (1, 1, 1, 1, 1), (3, 3, 3, 3, 3)),
     'conv_cascading_5l': conv_cascading_head_class((2, 1, 1, 1, 1), (1, 1, 1, 1, 1), (3, 3, 3, 3, 3)),
+    'ranet_head': ranet_head_class(128, 128, 4),
+    'ranet_head_v2': ranet_head_class(None, None, 4),
     'vit_standard_head': vit_standard_head_class(1),
     'vit_2l_head': vit_standard_head_class(2, 1024),
     'vit_2l_2048_head': vit_standard_head_class(2, 2048),

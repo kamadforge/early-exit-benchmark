@@ -1,17 +1,19 @@
 import logging
 from collections import defaultdict
-from typing import List, Tuple, Dict
+from typing import Callable, Dict, List, Tuple
 
 import torch
 from accelerate import Accelerator
-from fvcore.nn import FlopCountAnalysis, parameter_count, flop_count_table
+from fvcore.nn import FlopCountAnalysis, flop_count_table, parameter_count
 from sklearn.metrics import roc_auc_score
-from torch.nn import MultiheadAttention, LayerNorm
+from torch.nn import LayerNorm, MSELoss, MultiheadAttention
 from torchvision.models.vision_transformer import MLP
 
 from architectures.early_exits.pbee import PBEE
 from architectures.vit import MLP as CustomMLP
-from utils import flop_count, get_module_by_name, remove_hooks, find_module_names, add_save_activations_hook
+from common import PROB_TO_CONFIDENCE_MAP
+from utils import (add_save_activations_hook, find_module_names, flop_count,
+                   get_module_by_name, remove_hooks)
 
 
 def test_classification(accelerator: Accelerator,
@@ -22,20 +24,81 @@ def test_classification(accelerator: Accelerator,
     criterion = criterion_class(reduction='sum')
     model.eval()
     with torch.inference_mode():
+        if criterion_class == MSELoss:
+            running_loss = 0.0
+            correct, total = 0, 0
+            for batch, (X, y) in enumerate(data_loader):
+                y_pred = model(X)
+                y_pred, y = accelerator.gather_for_metrics((y_pred, y))
+                loss = criterion(y_pred, y)
+                running_loss += loss.item()
+                total += y.size(0)
+        else:
+            running_loss = 0.0
+            correct, total = 0, 0
+            for batch, (X, y) in enumerate(data_loader):
+                y_pred = model(X)
+                y_pred, y = accelerator.gather_for_metrics((y_pred, y))
+                y_pred_max = y_pred.argmax(dim=1)
+                loss = criterion(y_pred, y)
+                running_loss += loss.item()
+                correct += (y_pred_max == y).sum().item()
+                total += y.size(0)
+                if batches > 0 and batch == batches - 1:
+                    break
+    # loss, acc
+    return running_loss / total, correct / total
+
+# def test_classification(accelerator: Accelerator,
+#                         model: torch.nn.Module,
+#                         data_loader: torch.utils.data.DataLoader,
+#                         criterion_class: torch.nn.Module,
+#                         batches: int = 0) -> Tuple[float, float]:
+#     criterion = criterion_class(reduction='sum')
+#     model.eval()
+#     with torch.inference_mode():
+#         running_loss = 0.0
+#         correct, total = 0, 0
+#         for batch, (X, y) in enumerate(data_loader):
+#             y_pred = model(X)
+#             y_pred, y = accelerator.gather_for_metrics((y_pred, y))
+#             y_pred_max = y_pred.argmax(dim=1)
+#             loss = criterion(y_pred, y)
+#             running_loss += loss.item()
+#             correct += (y_pred_max == y).sum().item()
+#             total += y.size(0)
+#             if batches > 0 and batch == batches - 1:
+#                 break
+#     # loss, acc
+#     return running_loss / total, correct / total
+
+
+def test_classification_top5(accelerator: Accelerator,
+                        model: torch.nn.Module,
+                        data_loader: torch.utils.data.DataLoader,
+                        criterion_class: torch.nn.Module,
+                        batches: int = 0) -> Tuple[float, float, float]:
+    criterion = criterion_class(reduction='sum')
+    model.eval()
+    with torch.inference_mode():
         running_loss = 0.0
-        correct, total = 0, 0
+        top1_correct, top5_correct, total = 0, 0, 0
         for batch, (X, y) in enumerate(data_loader):
             y_pred = model(X)
             y_pred, y = accelerator.gather_for_metrics((y_pred, y))
             y_pred_max = y_pred.argmax(dim=1)
+            _, y_pred_top5 = torch.topk(y_pred, 5, dim=1)
             loss = criterion(y_pred, y)
             running_loss += loss.item()
-            correct += (y_pred_max == y).sum().item()
             total += y.size(0)
+            # Top-1 accuracy
+            top1_correct += (y_pred_max == y).sum().item()
+            # Top-5 accuracy
+            top5_correct += torch.sum(torch.eq(y_pred_top5, y.unsqueeze(1)).any(dim=1)).item()
             if batches > 0 and batch == batches - 1:
                 break
-    # loss, acc
-    return running_loss / total, correct / total
+    # loss, top1 acc, top5 acc
+    return running_loss / total, top1_correct / total, top5_correct / total
 
 
 def get_preds(accelerator: Accelerator,
@@ -92,8 +155,22 @@ def test_earlyexiting_classification(accelerator: Accelerator,
     criterion = criterion_class(reduction='mean')
     head_preds, ys = get_preds_earlyexiting(accelerator, model, data_loader, batches)
     head_losses = [criterion(preds, ys) for preds in head_preds]
-    head_accuracies = [(preds.argmax(dim=1) == ys).sum().item() / ys.size(0) for preds in head_preds]
+    if criterion_class == MSELoss:
+        head_accuracies = [0.0 for preds in head_preds]
+    else:
+        head_accuracies = [(preds.argmax(dim=1) == ys).sum().item() / ys.size(0) for preds in head_preds]
     return head_losses, head_accuracies
+
+# def test_earlyexiting_classification(accelerator: Accelerator,
+#                                      model: torch.nn.Module,
+#                                      data_loader: torch.utils.data.DataLoader,
+#                                      criterion_class: torch.nn.Module,
+#                                      batches: int = 0):
+#     criterion = criterion_class(reduction='mean')
+#     head_preds, ys = get_preds_earlyexiting(accelerator, model, data_loader, batches)
+#     head_losses = [criterion(preds, ys) for preds in head_preds]
+#     head_accuracies = [(preds.argmax(dim=1) == ys).sum().item() / ys.size(0) for preds in head_preds]
+#     return head_losses, head_accuracies
 
 
 def average_earlyexiting_flops(head_costs: List, head_exit_counts: torch.Tensor):
@@ -104,17 +181,69 @@ def average_earlyexiting_flops(head_costs: List, head_exit_counts: torch.Tensor)
     average_cost = total_cost / head_exit_counts.sum().item()
     return average_cost
 
+tau = 0.5
+
+def evaluate_earlyexiting_regression(head_preds: List[torch.Tensor],
+                                      labels: torch.Tensor,
+                                      head_costs: List[int]) -> Dict:
+    head_flops = head_costs
+    head_losses = []
+    threshold_losses = []
+    threshold_flops = []
+
+    criterion = MSELoss()
+    for i, head_pred in enumerate(head_preds):
+        head_loss = criterion(head_pred, labels)
+        head_losses.append(head_loss)
+
+
+    patience_thresholds = torch.arange(0, len(head_preds), device=labels.device)
+    for patience_threshold in patience_thresholds:
+        exit_at = torch.zeros_like(labels, dtype=torch.int) - 1
+        outputs = torch.zeros_like(head_preds[0])
+        prev_answers = torch.zeros_like(labels) - 1
+        patience = torch.zeros_like(prev_answers)
+        for i, head_pred in enumerate(head_preds):                
+            if i == 0:
+                patience = torch.ones_like(prev_answers)
+            else:
+                num_diff = torch.sum(torch.abs(head_pred - prev_answers) < tau)
+                patience = torch.where(torch.abs(head_pred - prev_answers) < tau, patience + 1, 1)
+
+            unresolved_mask = exit_at == -1
+            exit_mask = (patience > patience_threshold) & unresolved_mask
+            exit_at[exit_mask] = i
+            outputs[exit_mask] = head_pred[exit_mask]
+            prev_answers = head_pred
+        unresolved_mask = exit_at == -1
+        outputs[unresolved_mask] = head_preds[-1][unresolved_mask]
+        exit_at[unresolved_mask] = len(head_preds) - 1
+        threshold_loss = criterion(outputs, labels).item()
+        
+        exits_bincounted = exit_at.bincount(minlength=len(head_preds))
+        threshold_cost = average_earlyexiting_flops(head_flops, exits_bincounted)
+        threshold_losses.append(threshold_loss)
+        threshold_flops.append(threshold_cost)
+    results = {'head_scores': head_losses, 'head_flops': head_flops,
+               'threshold_scores': threshold_losses, 'threshold_flops': threshold_flops}
+    return results
 
 def evaluate_earlyexiting_classification(model: torch.nn.Module,
                                          head_preds: List[torch.Tensor],
                                          labels: torch.Tensor,
                                          head_costs: List[FlopCountAnalysis],
-                                         eval_thresholds: int) -> Dict:
+                                         eval_thresholds: int,
+                                         prob_to_confidence: Callable=PROB_TO_CONFIDENCE_MAP['max_prob']) -> Dict:
+    if head_preds[0].dim() == 1:
+        head_flops = [head_cost.total() for head_cost in head_costs]
+        return evaluate_earlyexiting_regression(head_preds, labels, head_flops)
+    
     head_accuracies = []
     for i, head_pred in enumerate(head_preds):
-        head_accuracy = (head_pred.argmax(dim=1) == labels).sum().item() / labels.size(0)
+        head_accuracy = (head_pred.argmax(dim=1) == labels).sum().item() / labels.size(0)  
         head_accuracies.append(head_accuracy)
     head_flops = [head_cost.total() for head_cost in head_costs]
+
     thresholds = torch.linspace(0.0, 1.0, steps=eval_thresholds, device=labels.device)
     threshold_accuracies = []
     threshold_flops = []
@@ -122,7 +251,7 @@ def evaluate_earlyexiting_classification(model: torch.nn.Module,
     if isinstance(model, PBEE):
         patience_thresholds = torch.arange(0, len(head_preds), device=labels.device)
         for patience_threshold in patience_thresholds:
-            exit_at = torch.zeros_like(labels) - 1
+            exit_at = torch.zeros_like(labels, dtype=torch.int) - 1
             outputs = torch.zeros_like(head_preds[0])
             # start from second head, set patience to one after first head
             prev_answers = torch.zeros_like(labels) - 1
@@ -149,7 +278,7 @@ def evaluate_earlyexiting_classification(model: torch.nn.Module,
             exit_at = torch.zeros_like(labels) - 1
             outputs = torch.zeros_like(head_probs[0])
             for i, head_prob in enumerate(head_probs):
-                head_confidences, _ = head_prob.max(dim=-1)
+                head_confidences = prob_to_confidence(head_prob)
                 unresolved_mask = exit_at == -1
                 exit_mask = (head_confidences > threshold) & unresolved_mask
                 exit_at[exit_mask] = i
@@ -174,6 +303,12 @@ def evaluate_classification(preds: torch.Tensor, labels: torch.Tensor, criterion
     accuracy = (preds_max == labels).double().mean().item()
     return loss, accuracy
 
+def evaluate_regression(preds: torch.Tensor,
+                         labels: torch.Tensor) -> Dict:
+    criterion = MSELoss()
+    score = criterion(preds, labels)
+    results = {'final_score': score}
+    return results
 
 def ks_calibration_error(probs, labels):
     '''https://arxiv.org/abs/2006.12800'''
@@ -296,7 +431,10 @@ def benchmark(model: torch.nn.Module,
             m.train()
     #
     X, _ = next(iter(data_loader))
-    sample = X[:1]
+    if isinstance(X, dict):
+        sample = {k: v[:1] for k, v in X.items()}
+    else:
+        sample = X[:1]
     with torch.inference_mode():
         model_costs = flop_count(model, (sample,))
         param_count = parameter_count(model)
@@ -324,7 +462,10 @@ def benchmark_earlyexiting(model: torch.nn.Module,
             m.train()
     #
     X, _ = next(iter(data_loader))
-    sample = X[0].unsqueeze(0)
+    if isinstance(X, dict):
+        sample = {k: v[0].unsqueeze(0) for k, v in X.items()}
+    else:
+        sample = X[0].unsqueeze(0)
     with torch.inference_mode():
         param_count = parameter_count(model)
         head_costs = []
@@ -341,4 +482,3 @@ def benchmark_earlyexiting(model: torch.nn.Module,
         for m in uncalled:
             logging.warning(f'Uncalled module: {m}')
     return head_costs, param_count
-

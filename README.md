@@ -3,7 +3,7 @@ TODO
   
 # Running
 0. Make sure that [conda](https://docs.conda.io/projects/conda/en/latest/user-guide/install/linux.html) is installed on your server, and that it's present in `$PATH`. You may want to install it by yourself, or ask whether conda is already installed somewhere and just add it to `$PATH`.
-0. If `effbench_env` is not visible in conda, e.g it's a fresh conda installation, create this environment:
+0. If `effbench_ee_env` is not visible in conda, e.g it's a fresh conda installation, create this environment:
 `bash create_env.sh`
 1. Optionally create a [W&B](https://wandb.ai/) account and add the following content to your `~/.bashrc`:
 `export WANDB_API_KEY="<YOUR_KEY>"`

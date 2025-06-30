@@ -5,21 +5,32 @@ import torch.nn
 from torch import nn, optim
 from torch.nn.init import calculate_gain
 
-# from architectures.avit import AvitWrapper
-from architectures.custom import FCNet, DCNet
+from architectures.convnext import ConvNeXt, get_convnext_t
+from architectures.custom import DCNet, FCNet
 from architectures.early_exits.gpf import GPF
 from architectures.early_exits.l2w import L2W
+from architectures.early_exits.msdnet import MSDNet
 from architectures.early_exits.pbee import PBEE
+from architectures.early_exits.ranet import RANet
 from architectures.early_exits.sdn import SDN
 from architectures.early_exits.ztw import ZTWCascading, ZTWEnsembling
 from architectures.efficientnet import EfficientNetV2
-from architectures.pretrained import get_efficientnet_v2_s_pretrained, get_vit_b_16_pretrained, get_efficientnet_b0_pretrained, get_convnext_t_pretrained, \
-    get_swin_v2_s_pretrained, get_vit_b_16_adapt_head
-from architectures.resnets import ResNet50, ResNet101, ResNet152, ResNet34, ResNet18
-from architectures.tv_models import get_efficientnet_v2_s
+from architectures.nlp import (get_bert_base, get_bert_large,
+                               get_distilbert_base, get_roberta_base)
+from architectures.pretrained import (get_convnext_t_pretrained,
+                                      get_efficientnet_b0_pretrained,
+                                      get_efficientnet_v2_s_pretrained,
+                                      get_swin_v2_s_pretrained,
+                                      get_vit_b_16_adapt_head,
+                                      get_vit_b_16_pretrained)
+from architectures.resnets import (ResNet18, ResNet34, ResNet50, ResNet101,
+                                   ResNet152)
+from architectures.tv_models import (get_convnext_t, get_efficientnet_b0,
+                                     get_efficientnet_v2_s, get_swin_v2_s)
 from architectures.vgg import VGG16BN
-from architectures.vit import VisionTransformer, MLP
+from architectures.vit import MLP, VisionTransformer
 from architectures.wide_resnets import WideResNet
+from metrics.confidences import normalized_entropy_confidence
 from utils import BCEWithLogitsLossWrapper
 
 
@@ -103,6 +114,9 @@ def get_default_args():
     default_args.auxiliary_loss_type = None  # type of the auxiliary loss for early-exit heads
     default_args.auxiliary_loss_weight = None  # weight of the auxiliary loss for early-exit heads
     default_args.eval_thresholds = None  # number of early exit thresholds to evaluate
+    default_args.gradient_equilibrium = None  # whether we want to train a backbone with heads via gradient equalibrum
+    default_args.aggregate_loss = None
+    default_args.gather_stats = None
     # L2W
     default_args.l2w_meta_interval = None  # every n-th batch will have meta step enabled
     default_args.wpn_width = None  # weight prediction network hidden layers width
@@ -113,6 +127,18 @@ def get_default_args():
     default_args.wpn_scheduler_args = None  # arguments to be passed to the WPN scheduler init function
     default_args.l2w_epsilon = None  # epsilon which weights the pseudo weights (0.3 used in the paper)
     default_args.l2w_target_p = None  # target p that determines the head budget allocation (15 used in the paper)
+
+    # Ranks
+    default_args.is_rank_train = False
+    default_args.is_rank_test = False
+    default_args.rank_multiplier = 50
+    default_args.is_mi_train = False
+    default_args.is_mi_test = False
+    default_args.mi_multiplier = 50
+    default_args.MAX_REPR_SIZE = 2000
+
+    # Multi-head loss
+    default_args.aggregate_loss = 'arith_mean'
 
     return default_args
 
@@ -169,8 +195,11 @@ MODEL_NAME_MAP = {
     'resnet152': ResNet152,
     'wideresnet': WideResNet,
     'efficientnetv2': EfficientNetV2,
+    'convnext_t': get_convnext_t,
     'vit': VisionTransformer,
     'sdn': SDN,
+    'msdnet': MSDNet,
+    'ranet': RANet,
     'pbee': PBEE,
     'gpf': GPF,
     'l2w': L2W,
@@ -178,9 +207,22 @@ MODEL_NAME_MAP = {
     'ztw_ensembling': ZTWEnsembling,
     'tv_convnext_t_pretrained': get_convnext_t_pretrained,
     'tv_efficientnet_b0_pretrained': get_efficientnet_b0_pretrained,
+    'tv_efficientnet_b0': get_efficientnet_b0,
     'tv_efficientnet_s_pretrained': get_efficientnet_v2_s_pretrained,
     'tv_vit_b_16_pretrained': get_vit_b_16_pretrained,
+    'tv_vit_b_16_adapt_head': get_vit_b_16_adapt_head,
     'tv_swin_v2_s_pretrained': get_swin_v2_s_pretrained,
+    'tv_swin_v2_s': get_swin_v2_s,
     'tv_efficientnet_s': get_efficientnet_v2_s,
-    'tv_vit_b_16_adapt_head': get_vit_b_16_adapt_head
+    'tv_convnext_t': get_convnext_t,
+    'convnext': ConvNeXt,
+    'bert_base': get_bert_base,
+    'bert_large': get_bert_large,
+    'distilbert_base': get_distilbert_base,
+    'roberta_base': get_roberta_base,
+}
+
+PROB_TO_CONFIDENCE_MAP = {
+    'max_prob' : lambda probs: probs.max(dim=-1)[0],
+    'normalized_entropy' : normalized_entropy_confidence,
 }

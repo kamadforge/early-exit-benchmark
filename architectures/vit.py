@@ -310,7 +310,7 @@ class VisionTransformer(nn.Module):
         if conv_stem_configs is not None:
             # As per https://arxiv.org/abs/2106.14881
             seq_proj = nn.Sequential()
-            prev_channels = 3
+            prev_channels = input_channels
             for i, conv_stem_layer_config in enumerate(conv_stem_configs):
                 seq_proj.add_module(
                     f"conv_bn_relu_{i}",
@@ -330,7 +330,7 @@ class VisionTransformer(nn.Module):
             self.conv_proj: nn.Module = seq_proj
         else:
             self.conv_proj = nn.Conv2d(
-                in_channels=3, out_channels=hidden_dim, kernel_size=patch_size, stride=patch_size
+                in_channels=input_channels, out_channels=hidden_dim, kernel_size=patch_size, stride=patch_size
             )
         seq_length = (image_size // patch_size) ** 2
         # Add a class token
@@ -428,6 +428,14 @@ class VisionTransformer(nn.Module):
         x = x[:, 0]
         x = self.heads(x)
         _ = yield None, x
+
+    def per_head_block_modules(self):
+        encoder_layers = list(self.encoder.layers)
+        encoder_layers[0] = nn.ModuleList([self.conv_proj, nn.ParameterList([self.class_token, self.encoder.pos_embedding]), encoder_layers[0]])
+        last_layer = nn.ModuleList([self.encoder.ln, self.heads])
+
+        blocks = encoder_layers + [last_layer]
+        return blocks
 
 
 def ffn_filter_condition(_model: nn.Module, m: nn.Module):

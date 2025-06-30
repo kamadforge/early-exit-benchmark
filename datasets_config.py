@@ -1,3 +1,4 @@
+import logging
 import math
 import os
 import random
@@ -5,11 +6,19 @@ import warnings
 from functools import partial
 from pathlib import Path
 
+import numpy as np
+import torch
+from datasets import load_dataset
 from PIL import ImageFilter, ImageOps
+from sklearn.datasets import fetch_20newsgroups
 from torchvision import datasets, transforms
-from torchvision.models import ViT_B_16_Weights, EfficientNet_V2_S_Weights, EfficientNet_B0_Weights, \
-    ConvNeXt_Tiny_Weights, Swin_V2_S_Weights
+from torchvision.models import (ConvNeXt_Tiny_Weights, EfficientNet_B0_Weights,
+                                EfficientNet_V2_S_Weights, Swin_V2_S_Weights,
+                                ViT_B_16_Weights)
 from torchvision.transforms import InterpolationMode
+from transformers import AutoTokenizer
+
+from imagenet_memfs import Imagenet
 
 DOWNLOAD = False
 
@@ -58,8 +67,7 @@ def get_cifar10(normalization=None):
     test_data = datasets.CIFAR10(dataset_path, train=False, download=DOWNLOAD, transform=transform_eval)
     return train_data, train_eval_data, test_data
 
-
-def get_cifar100(normalization=True, resize=False):
+def get_cifar100(normalization=True, variant=None, image_size=None, resize=False):
     if normalization == '0.5':
         mean, std = (0.5, 0.5, 0.5), (0.5, 0.5, 0.5)
         normalize = transforms.Normalize(mean, std)
@@ -68,12 +76,10 @@ def get_cifar100(normalization=True, resize=False):
     else:
         mean, std = (0.5071, 0.4865, 0.4409), (0.267, 0.256, 0.276)
         normalize = transforms.Normalize(mean, std)
-
     if resize:
         base_transforms = [transforms.Resize(resize)]
     else:
         base_transforms = []
-
     transform_eval = transforms.Compose([
         *base_transforms,
         transforms.ToTensor(),
@@ -86,11 +92,38 @@ def get_cifar100(normalization=True, resize=False):
         normalize,
         transforms.RandomErasing(p=0.1),
     ])
+    # transform_train = transforms.Compose([
+    #     transforms.RandomHorizontalFlip(p=0.5),
+    #     transforms.RandomAffine(degrees=10, translate=(1/8, 1/8)),
+    #     transforms.ToTensor(),
+    #     normalize,
+    #     # transforms.RandomErasing(p=0.05),
+    # ])
+    if variant == 'trivial_augment':
+        transform_img_size = resize or image_size
+        transform_train = transforms.Compose([
+            *base_transforms,
+            transforms.RandomResizedCrop(transform_img_size, interpolation=InterpolationMode.BICUBIC),
+            transforms.TrivialAugmentWide(interpolation=InterpolationMode.BICUBIC),
+            transforms.ToTensor(),
+            normalize,
+            transforms.RandomErasing(p=0.1),
+        ])
+        transform_eval = transforms.Compose([
+            *base_transforms,
+            transforms.Resize(transform_img_size, interpolation=InterpolationMode.BICUBIC),
+            transforms.CenterCrop(transform_img_size),
+            transforms.ToTensor(),
+            normalize,
+        ])
+
+
     dataset_path = os.environ['CIFAR100_PATH']
     train_data = datasets.CIFAR100(dataset_path, train=True, download=DOWNLOAD, transform=transform_train)
     train_eval_data = datasets.CIFAR100(dataset_path, train=True, download=DOWNLOAD, transform=transform_eval)
     test_data = datasets.CIFAR100(dataset_path, train=False, download=DOWNLOAD, transform=transform_eval)
     return train_data, train_eval_data, test_data
+
 
 
 class GaussianBlur:
@@ -328,7 +361,19 @@ def get_imagenet(normalization=None, variant=None, image_size=None):
             transforms.RandomErasing(p=0.1),
         ])
         transform_eval = Swin_V2_S_Weights.IMAGENET1K_V1.transforms()
+    
     dataset_path = os.environ['IMAGENET_PATH']
+    imagenet_use_memfs = os.environ.get('USE_MEMFS', 'false').lower()
+    assert imagenet_use_memfs in ['true', 'false']
+
+    if imagenet_use_memfs == 'true':
+        logging.info(f'using memfs')
+        data_dir = "/memfs/" + os.environ['SLURM_JOB_ID']
+        Imagenet(data_dir, dataset_path).load_to_memfs()
+        dataset_path = data_dir
+    else:
+        logging.info(f'not using memfs')
+
     train_data = datasets.ImageNet(dataset_path, transform=transform_train)
     train_eval_data = datasets.ImageNet(dataset_path, transform=transform_eval)
     test_data = datasets.ImageNet(dataset_path, split='val', transform=transform_eval)
@@ -345,10 +390,10 @@ def get_imagenet_c(severity, distortion=None, normalization=None, variant=None, 
         mean, std = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
         normalize = transforms.Normalize(mean, std)
     img_size = 224 if image_size is None else image_size
-    if distortion:
-        dataset_path = str(Path(os.environ['IMAGENET_C_PATH']) / str(distortion) / str(severity))
-    else:
+    if distortion is None:
         dataset_path = str(Path(os.environ['IMAGENET_C_AGGREGATED_PATH']) / str(severity))
+    else:
+        dataset_path = str(Path(os.environ['IMAGENET_C_PATH']) / distortion / str(severity))
     if variant == 'trivial_augment':
         transform_eval = transforms.Compose([
             transforms.Resize(img_size, interpolation=InterpolationMode.BICUBIC),
@@ -387,13 +432,18 @@ def get_imagenet_c(severity, distortion=None, normalization=None, variant=None, 
 def get_tinyimagenet(normalization=None, variant=None):
     if normalization == '0.5':
         mean, std = (0.5, 0.5, 0.5), (0.5, 0.5, 0.5)
-        normalize = transforms.Normalize(mean, std)
-    elif normalization == 'skip':
-        normalize = transforms.Compose([])
     else:
         mean, std = (0.4802, 0.4481, 0.3975), (0.2302, 0.2265, 0.2262)
         normalize = transforms.Normalize(mean, std)
     if variant is None or variant == 'trivial_augment':
+        # transform_train = transforms.Compose([
+        #     transforms.RandomCrop(64, padding=4),
+        #     transforms.RandomHorizontalFlip(p=0.5),
+        #     transforms.RandomAffine(degrees=10, translate=(1/8, 1/8)),
+        #     transforms.ToTensor(),
+        #     normalize,
+        #     # transforms.RandomErasing(p=0.05),
+        # ])
         transform_train = transforms.Compose([
             transforms.TrivialAugmentWide(),
             transforms.RandomCrop(64, padding=8),
@@ -415,6 +465,36 @@ def get_tinyimagenet(normalization=None, variant=None):
         transforms.Normalize(mean, std),
     ])
     dataset_path = os.environ['TINYIMAGENET_PATH']
+    train_path = f'{dataset_path}/train'
+    test_path = f'{dataset_path}/val'
+    train_data = datasets.ImageFolder(train_path, transform=transform_train)
+    train_eval_data = datasets.ImageFolder(train_path, transform=transform_eval)
+    test_data = datasets.ImageFolder(test_path, transform=transform_eval)
+    return train_data, train_eval_data, test_data
+
+
+def get_imagenette(normalization=None, variant=None, image_size=None):
+    if normalization == '0.5':
+        mean, std = (0.5, 0.5, 0.5), (0.5, 0.5, 0.5)
+    else:
+        mean, std = (0.4802, 0.4481, 0.3975), (0.2302, 0.2265, 0.2262)
+    normalize = transforms.Normalize(mean, std)
+
+    img_size = 224 if image_size is None else image_size
+    transform_train = transforms.Compose([
+        transforms.RandomResizedCrop(img_size, interpolation=InterpolationMode.BICUBIC),
+        transforms.TrivialAugmentWide(interpolation=InterpolationMode.BICUBIC),
+        transforms.ToTensor(),
+        normalize,
+        transforms.RandomErasing(p=0.1),
+    ])
+    transform_eval = transforms.Compose([
+        transforms.Resize(img_size, interpolation=InterpolationMode.BICUBIC),
+        transforms.CenterCrop(img_size),
+        transforms.ToTensor(),
+        normalize,
+    ])
+    dataset_path = os.environ['IMAGENETTE_PATH']
     train_path = f'{dataset_path}/train'
     test_path = f'{dataset_path}/val'
     train_data = datasets.ImageFolder(train_path, transform=transform_train)
@@ -512,17 +592,340 @@ def get_food101(normalization=None, variant=None, image_size=None):
     return train_data, train_eval_data, test_data
 
 
+class NlpHfDatasetWrapper(torch.utils.data.Dataset):
+    def __init__(self, dataset):
+        super().__init__()
+        self.dataset = dataset
+        self.targets = [x['label'] for x in dataset]
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        if isinstance(idx, np.int64):
+            idx = int(idx)
+        sample = self.dataset[idx]
+        y = sample.pop('label')
+        return sample, y
+
+
+class NlpDictDatasetWrapper(torch.utils.data.Dataset):
+    def __init__(self, dataset):
+        super().__init__()
+        self.dataset = dataset
+        self.targets = dataset['label']
+
+    def __len__(self):
+        return len(self.dataset['label'])
+
+    def __getitem__(self, idx):
+        sample = {k: v[idx] for k, v in self.dataset.items()}
+        y = sample.pop('label')
+        return sample, y
+
+
+def get_rte(tokenizer_name=None, padding="max_length", max_seq_length=128, truncation=True):
+    return get_glue_dataset('rte', tokenizer_name=tokenizer_name, padding=padding, max_seq_length=max_seq_length,
+                            truncation=truncation)
+
+
+def get_qqp(tokenizer_name=None, padding="max_length", max_seq_length=128, truncation=True):
+    return get_glue_dataset('qqp', tokenizer_name=tokenizer_name, padding=padding, max_seq_length=max_seq_length,
+                            truncation=truncation)
+
+
+def get_qnli(tokenizer_name=None, padding="max_length", max_seq_length=128, truncation=True):
+    return get_glue_dataset('qnli', tokenizer_name=tokenizer_name, padding=padding, max_seq_length=max_seq_length,
+                            truncation=truncation)
+
+
+def get_mrpc(tokenizer_name=None, padding="max_length", max_seq_length=128, truncation=True):
+    return get_glue_dataset('mrpc', tokenizer_name=tokenizer_name, padding=padding, max_seq_length=max_seq_length,
+                            truncation=truncation)
+
+
+def get_sst2(tokenizer_name=None, padding="max_length", max_seq_length=128, truncation=True):
+    return get_glue_dataset('sst2', tokenizer_name=tokenizer_name, padding=padding, max_seq_length=max_seq_length,
+                            truncation=truncation)
+
+
+def get_stsb(tokenizer_name=None, padding="max_length", max_seq_length=128, truncation=True):
+    return get_glue_dataset('stsb', tokenizer_name=tokenizer_name, padding=padding, max_seq_length=max_seq_length,
+                            truncation=truncation)
+
+def get_glue_dataset(task_name, tokenizer_name=None, padding="max_length", max_seq_length=128, truncation=True):
+    train_dataset = load_dataset("glue", task_name, split='train', cache_dir=os.environ['TRANSFORMERS_CACHE_DIR'])
+    validation_dataset = load_dataset("glue", task_name, split='validation',
+                                      cache_dir=os.environ['TRANSFORMERS_CACHE_DIR'])
+
+    task_to_keys = {
+        # "cola": ("sentence", None),
+        # "mnli": ("premise", "hypothesis"),
+        "mrpc": ("sentence1", "sentence2"),
+        "qnli": ("question", "sentence"),
+        "qqp": ("question1", "question2"),
+        "rte": ("sentence1", "sentence2"),
+        "sst2": ("sentence", None),
+        "stsb": ("sentence1", "sentence2"),
+        # "wnli": ("sentence1", "sentence2"),
+    }
+    if task_name not in task_to_keys.keys():
+        raise NotImplementedError()
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name,
+                                              use_fast=True,
+                                              cache_dir=os.environ['TRANSFORMERS_CACHE_DIR'])
+    sentence1_key, sentence2_key = task_to_keys[task_name]
+
+    def preprocess_function(examples):
+        args = (
+            (examples[sentence1_key],)
+            if sentence2_key is None
+            else (examples[sentence1_key], examples[sentence2_key])
+        )
+        result = tokenizer(
+            *args, padding=padding, max_length=max_seq_length, truncation=truncation
+        )
+
+        return result
+
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    train_dataset = train_dataset.map(
+        preprocess_function,
+        batched=True,
+        desc=f"Running tokenizer on {task_name}:train",
+    )
+    validation_dataset = validation_dataset.map(
+        preprocess_function,
+        batched=True,
+        desc=f"Running tokenizer on {task_name}:validation",
+    )
+
+    if tokenizer_name.startswith('bert'):
+        train_dataset.set_format(
+            type="torch",
+            columns=["input_ids", "token_type_ids", "attention_mask", "label"],
+        )
+        validation_dataset.set_format(
+            type="torch",
+            columns=["input_ids", "token_type_ids", "attention_mask", "label"],
+        )
+    elif 'roberta' in tokenizer_name or 'distilbert' in tokenizer_name:
+        train_dataset.set_format(
+            type="torch",
+            columns=["input_ids", "attention_mask", "label"],
+        )
+        validation_dataset.set_format(
+            type="torch",
+            columns=["input_ids", "attention_mask", "label"],
+        )
+    else:
+        raise NotImplementedError()
+
+    # GLUE tasks are tested on validation set
+    return NlpHfDatasetWrapper(train_dataset), \
+        NlpHfDatasetWrapper(validation_dataset), \
+        NlpHfDatasetWrapper(validation_dataset)
+
+
+def get_ag_news(tokenizer_name=None, padding="max_length", max_seq_length=128, truncation=True):
+    train_dataset = load_dataset("ag_news", split='train', cache_dir=os.environ['TRANSFORMERS_CACHE_DIR'])
+    test_dataset = load_dataset("ag_news", split='test', cache_dir=os.environ['TRANSFORMERS_CACHE_DIR'])
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name,
+                                              use_fast=True,
+                                              cache_dir=os.environ['TRANSFORMERS_CACHE_DIR'])
+
+    def preprocess_function(examples):
+
+        result = tokenizer(
+            examples['text'], padding=padding, max_length=max_seq_length, truncation=truncation
+        )
+
+        return result
+
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    train_dataset = train_dataset.map(
+        preprocess_function,
+        batched=True,
+        desc=f"Running tokenizer on ag_news:train",
+    )
+    test_dataset = test_dataset.map(
+        preprocess_function,
+        batched=True,
+        desc=f"Running tokenizer on ag_news:test",
+    )
+
+    if tokenizer_name.startswith('bert'):
+        train_dataset.set_format(
+            type="torch",
+            columns=["input_ids", "token_type_ids", "attention_mask", "label"],
+        )
+        test_dataset.set_format(
+            type="torch",
+            columns=["input_ids", "token_type_ids", "attention_mask", "label"],
+        )
+    elif 'roberta' in tokenizer_name or 'distilbert' in tokenizer_name:
+        train_dataset.set_format(
+            type="torch",
+            columns=["input_ids", "attention_mask", "label"],
+        )
+        test_dataset.set_format(
+            type="torch",
+            columns=["input_ids", "attention_mask", "label"],
+        )
+    else:
+        raise NotImplementedError()
+
+    # GLUE tasks are tested on validation set
+    return NlpHfDatasetWrapper(train_dataset), \
+        NlpHfDatasetWrapper(test_dataset), \
+        NlpHfDatasetWrapper(test_dataset)
+
+
+def get_dbpedia14(tokenizer_name=None, padding="max_length", max_seq_length=128, truncation=True):
+    train_dataset = load_dataset("dbpedia_14", split='train', cache_dir=os.environ['TRANSFORMERS_CACHE_DIR'])
+    test_dataset = load_dataset("dbpedia_14", split='test', cache_dir=os.environ['TRANSFORMERS_CACHE_DIR'])
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name,
+                                              use_fast=True,
+                                              cache_dir=os.environ['TRANSFORMERS_CACHE_DIR'])
+
+    def preprocess_function(examples):
+
+        result = tokenizer(
+            examples['content'], padding=padding, max_length=max_seq_length, truncation=truncation
+        )
+
+        return result
+
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    train_dataset = train_dataset.map(
+        preprocess_function,
+        batched=True,
+        desc=f"Running tokenizer on dbpedia14:train",
+    )
+    test_dataset = test_dataset.map(
+        preprocess_function,
+        batched=True,
+        desc=f"Running tokenizer on dbpedia14:test",
+    )
+
+    if tokenizer_name.startswith('bert'):
+        train_dataset.set_format(
+            type="torch",
+            columns=["input_ids", "token_type_ids", "attention_mask", "label"],
+        )
+        test_dataset.set_format(
+            type="torch",
+            columns=["input_ids", "token_type_ids", "attention_mask", "label"],
+        )
+    elif 'roberta' in tokenizer_name or 'distilbert' in tokenizer_name:
+        train_dataset.set_format(
+            type="torch",
+            columns=["input_ids", "attention_mask", "label"],
+        )
+        test_dataset.set_format(
+            type="torch",
+            columns=["input_ids", "attention_mask", "label"],
+        )
+    else:
+        raise NotImplementedError()
+
+    # GLUE tasks are tested on validation set
+    return NlpHfDatasetWrapper(train_dataset), \
+        NlpHfDatasetWrapper(test_dataset), \
+        NlpHfDatasetWrapper(test_dataset)
+
+
+def get_20newsgroups(tokenizer_name=None, padding="max_length", max_seq_length=512, truncation=True):
+    newsgroups_train = fetch_20newsgroups(subset='train', shuffle=True, data_home=os.environ['TRANSFORMERS_CACHE_DIR'])
+    newsgroups_test = fetch_20newsgroups(subset='test', shuffle=True, data_home=os.environ['TRANSFORMERS_CACHE_DIR'])
+
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name,
+                                              use_fast=True,
+                                              cache_dir=os.environ['TRANSFORMERS_CACHE_DIR'])
+
+    is_bert = tokenizer_name.startswith('bert')
+
+    def preprocess_function(examples):
+        result = tokenizer(
+            examples.data,
+            add_special_tokens=True,
+            return_token_type_ids=is_bert,
+            padding=padding,
+            max_length=max_seq_length,
+            truncation=truncation
+        )
+
+        output = {
+            'input_ids': torch.tensor(result['input_ids']),
+            'attention_mask': torch.tensor(result['attention_mask']),
+            'label': torch.tensor(examples.target)
+        }
+        if is_bert:
+            output['token_type_ids'] = torch.tensor(result['token_type_ids'])
+        return output
+
+    train_dataset = preprocess_function(newsgroups_train)
+    validation_dataset = preprocess_function(newsgroups_test)
+
+    return NlpDictDatasetWrapper(train_dataset), \
+        NlpDictDatasetWrapper(validation_dataset), \
+        NlpDictDatasetWrapper(validation_dataset)
+
+
 DATASETS_NAME_MAP = {
     'mnist': get_mnist,
     'cifar10': get_cifar10,
     'cifar100': get_cifar100,
     'tinyimagenet': get_tinyimagenet,
     'imagenet': get_imagenet,
-    'imagenet-c-1': partial(get_imagenet_c, 1),
-    'imagenet-c-2': partial(get_imagenet_c, 2),
-    'imagenet-c-3': partial(get_imagenet_c, 3),
-    'imagenet-c-4': partial(get_imagenet_c, 4),
-    'imagenet-c-5': partial(get_imagenet_c, 5),
+    'imagenet-c-1': partial(get_imagenet_c, distortion=None, severity=1),
+    'imagenet-c-2': partial(get_imagenet_c, distortion=None, severity=2),
+    'imagenet-c-3': partial(get_imagenet_c, distortion=None, severity=3),
+    'imagenet-c-4': partial(get_imagenet_c, distortion=None, severity=4),
+    'imagenet-c-5': partial(get_imagenet_c, distortion=None, severity=5),
     'cubbirds': get_cubbirds,
     'food101': get_food101,
+    'imagenette': get_imagenette,
+    'rte': get_rte,
+    'qqp': get_qqp,
+    'qnli': get_qnli,
+    'mrpc': get_mrpc,
+    'sst2': get_sst2,
+    'stsb': get_stsb,
+    '20newsgroups': get_20newsgroups,
+    'ag_news': get_ag_news,
+    'dbpedia14': get_dbpedia14
+}
+
+DATASET_TO_SEQUENCE_LENGTH = {
+    'rte': 128,
+    'qqp': 128,
+    'qnli': 128,
+    'mrpc': 128,
+    'sst2': 128,
+    'stsb': 128,
+    '20newsgroups': 512,
+    'ag_news': 128,
+    'dbpedia14': 128
+}
+DATASET_TO_NUM_CLASSES = {
+    'rte': 2,
+    'qqp': 2,
+    'qnli': 2,
+    'mrpc': 2,
+    'sst2': 2,
+    'stsb': 1,
+    '20newsgroups': 20,
+    'ag_news': 4,
+    'dbpedia14': 14,
+}
+MODEL_TO_TOKENIZER_NAME = {
+    'bert_base': 'bert-base-uncased',
+    'bert_large': 'bert-large-uncased',
+    'roberta_base': 'roberta-base',
+    'distilbert_base': 'distilbert-base-uncased',
 }

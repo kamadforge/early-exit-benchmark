@@ -1,13 +1,13 @@
-import logging
 from collections import defaultdict
 from math import sqrt
-from typing import Type, Set
+from typing import Set, Type
 
 import torch
 from torch import nn
 
 from architectures.early_exits.base import EarlyExitingBase
-from architectures.early_exits.heads import HEAD_TYPES, ViTHead, CNNHead, SwinHead
+from architectures.early_exits.heads import (HEAD_TYPES, CNNHead, SwinHead,
+                                             ViTHead)
 
 
 class GPF(EarlyExitingBase):
@@ -21,10 +21,15 @@ class GPF(EarlyExitingBase):
         self._head_dim = head_dim
         self._heads = nn.ModuleList()
         self._imitators = nn.ModuleList()
-        input_size = self._base_model.input_size if hasattr(self._base_model, 'input_size') else 32
-        channels = self._base_model.input_channels if hasattr(self._base_model, 'input_channels') else 3
         base_model_device = next(base_model.parameters()).device
-        x_input = torch.randn(1, channels, input_size, input_size, device=base_model_device)
+        if hasattr(self._base_model, "input_sequences"):
+            x_input = {
+                k: torch.ones((1, v), device=base_model_device, dtype=torch.int) for k, v in self._base_model.input_sequences.items()
+            }
+        else:
+            input_size = self._base_model.input_size if hasattr(self._base_model, 'input_size') else 32
+            channels = self._base_model.input_channels if hasattr(self._base_model, 'input_channels') else 3
+            x_input = torch.randn(1, channels, input_size, input_size, device=base_model_device)
         self._base_model.eval()
         # without the above eval() method call batch normalization statistics are updated in the forward below
         fg = self._base_model.forward_generator(x_input)
@@ -88,6 +93,7 @@ class GPF(EarlyExitingBase):
         # inconsistent with the description in the paper, but consistent with the original implementation
         # see https://github.com/lancopku/Early-Exit/blob/main/model/modeling_bert.py#L477-L503
         states = torch.stack(states, dim=1)
+        # states = torch.nn.functional.relu(states)  # ?, + batchnorm?
         # states is of (batch_size, num_heads, hidden_dim) size
         states = nn.functional.dropout(states, self._state_dropout).unsqueeze(-2)
         states_proj = (states @ self._reduction_layer_weight).squeeze(-2) + self._reduction_layer_bias

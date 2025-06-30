@@ -200,7 +200,13 @@ def training_loop(args, tc):
         # https://github.com/LeapLabTHU/L2W-DEN/blob/06b6f3ea8b08a3af283c14231175a24ee303065f/tools/main_imagenet_DDP.py#L325
         if tc.state.current_batch % args.l2w_meta_interval == 0 and tc.state.current_batch > 0:
             # split batch into two parts
-            X, X_meta = X.chunk(2)
+            if isinstance(X, dict):
+                _X, X_meta = {}, {}
+                for k, v in X.items():
+                    _X[k], X_meta[k] = v.chunk(2)
+                X = _X
+            else:
+                X, X_meta = X.chunk(2)
             y, y_meta = y.chunk(2)
             # create pseudo_net
             unwrapped_model = tc.accelerator.unwrap_model(tc.model)
